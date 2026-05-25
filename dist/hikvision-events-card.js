@@ -542,10 +542,7 @@ class HikvisionEventsCard extends HTMLElement {
   }
 }
 
-class HikvisionUnlockEventsCardAlias extends HikvisionEventsCard {}
-
 if (!customElements.get("hikvision-events-card")) customElements.define("hikvision-events-card", HikvisionEventsCard);
-if (!customElements.get("hikvision-unlock-events-card")) customElements.define("hikvision-unlock-events-card", HikvisionUnlockEventsCardAlias);
 
 window.customCards = window.customCards || [];
 if (!window.customCards.some((c) => c.type === "hikvision-events-card")) {
