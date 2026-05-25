@@ -5,18 +5,25 @@ const Card = customElements.get("hikvision-events-card");
 if (Card && !Card.__hikvisionHeightPatch) {
   Card.__hikvisionHeightPatch = true;
 
-  const clampHeight = (value) => {
+  const clampFixedHeight = (value) => {
     const num = Number(value);
     if (Number.isNaN(num)) return 520;
     return Math.max(160, Math.min(2000, num));
+  };
+
+  const numberFromPx = (value) => {
+    const num = Number.parseFloat(value);
+    return Number.isNaN(num) ? 0 : num;
   };
 
   const applyHeight = (instance) => {
     const root = instance?.shadowRoot;
     if (!root || !instance._config) return;
 
+    const card = root.querySelector("ha-card");
+    const wrap = root.querySelector(".wrap");
     const events = root.querySelector(".events");
-    if (!events) return;
+    if (!card || !events) return;
 
     events.style.overflowY = "auto";
     events.style.overflowX = "hidden";
@@ -24,22 +31,49 @@ if (Card && !Card.__hikvisionHeightPatch) {
     events.style.paddingRight = "4px";
     events.style.scrollbarWidth = "thin";
 
-    const fixedHeight = clampHeight(instance._config.fixed_height);
+    const fixedHeight = clampFixedHeight(instance._config.fixed_height);
 
     if (instance._config.auto_height === false) {
+      card.style.maxHeight = "";
+      card.style.overflow = "hidden";
       events.style.maxHeight = `${fixedHeight}px`;
       events.style.height = `${fixedHeight}px`;
       return;
     }
 
-    events.style.height = "auto";
-
-    const rect = events.getBoundingClientRect();
     const viewportHeight = window.innerHeight || document.documentElement.clientHeight || 800;
-    const bottomGap = 24;
-    const available = Math.max(180, Math.floor(viewportHeight - rect.top - bottomGap));
+    const bottomGap = 16;
+    const minListHeight = 96;
 
-    events.style.maxHeight = `${available}px`;
+    const cardRect = card.getBoundingClientRect();
+    const eventsRect = events.getBoundingClientRect();
+    const wrapStyle = wrap ? getComputedStyle(wrap) : null;
+    const wrapBottomPadding = wrapStyle ? numberFromPx(wrapStyle.paddingBottom) : 0;
+
+    const cardTopInViewport = Math.max(0, cardRect.top);
+    const maxCardHeight = Math.max(180, Math.floor(viewportHeight - cardTopInViewport - bottomGap));
+
+    const contentBeforeEvents = Math.max(0, Math.floor(eventsRect.top - cardRect.top));
+    const availableForEvents = Math.max(
+      minListHeight,
+      Math.floor(maxCardHeight - contentBeforeEvents - wrapBottomPadding)
+    );
+
+    card.style.maxHeight = `${maxCardHeight}px`;
+    card.style.overflow = "hidden";
+    events.style.height = "auto";
+    events.style.maxHeight = `${availableForEvents}px`;
+  };
+
+  const scheduleHeight = (instance) => {
+    if (!instance || instance.__hikvisionHeightFrame) return;
+
+    instance.__hikvisionHeightFrame = requestAnimationFrame(() => {
+      instance.__hikvisionHeightFrame = null;
+      applyHeight(instance);
+
+      requestAnimationFrame(() => applyHeight(instance));
+    });
   };
 
   const wrapAfterRender = (name) => {
@@ -48,7 +82,7 @@ if (Card && !Card.__hikvisionHeightPatch) {
 
     Card.prototype[name] = function (...args) {
       const result = original.apply(this, args);
-      applyHeight(this);
+      scheduleHeight(this);
       return result;
     };
   };
@@ -111,11 +145,11 @@ if (Card && !Card.__hikvisionHeightPatch) {
     const result = originalConnectedCallback?.apply(this, args);
 
     if (!this.__hikvisionHeightResize) {
-      this.__hikvisionHeightResize = () => applyHeight(this);
+      this.__hikvisionHeightResize = () => scheduleHeight(this);
     }
 
     window.addEventListener("resize", this.__hikvisionHeightResize);
-    requestAnimationFrame(() => applyHeight(this));
+    scheduleHeight(this);
     return result;
   };
 
@@ -123,6 +157,11 @@ if (Card && !Card.__hikvisionHeightPatch) {
   Card.prototype.disconnectedCallback = function (...args) {
     if (this.__hikvisionHeightResize) {
       window.removeEventListener("resize", this.__hikvisionHeightResize);
+    }
+
+    if (this.__hikvisionHeightFrame) {
+      cancelAnimationFrame(this.__hikvisionHeightFrame);
+      this.__hikvisionHeightFrame = null;
     }
 
     return originalDisconnectedCallback?.apply(this, args);
