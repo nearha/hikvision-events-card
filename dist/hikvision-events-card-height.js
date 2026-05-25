@@ -27,10 +27,11 @@ if (Card && !Card.__hikvisionSafeScrollPatch) {
     let scroller = root.querySelector(".events-scroll");
     if (scroller) return scroller;
 
-    const content = root.getElementById("content");
-    const events = content?.querySelector(":scope > .events") || root.querySelector(".events");
-    if (!content || !events || events.parentElement?.classList?.contains("events-scroll")) {
-      return events?.parentElement?.classList?.contains("events-scroll") ? events.parentElement : null;
+    const events = root.querySelector(".events");
+    if (!events) return null;
+
+    if (events.parentElement?.classList?.contains("events-scroll")) {
+      return events.parentElement;
     }
 
     scroller = document.createElement("div");
@@ -62,7 +63,7 @@ if (Card && !Card.__hikvisionSafeScrollPatch) {
       events.style.gridAutoRows = "max-content";
     }
 
-    scroller.querySelectorAll(".event-row").forEach((row) => {
+    scroller.querySelectorAll(".row, .event-row").forEach((row) => {
       row.style.height = "auto";
       row.style.minHeight = "";
       row.style.flexShrink = "0";
