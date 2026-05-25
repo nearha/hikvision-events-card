@@ -2,53 +2,75 @@ import "./hikvision-events-card.js";
 
 const Card = customElements.get("hikvision-events-card");
 
-if (Card && !Card.__hikvisionScrollWrapperPatch) {
-  Card.__hikvisionScrollWrapperPatch = true;
+if (Card && !Card.__hikvisionSafeScrollPatch) {
+  Card.__hikvisionSafeScrollPatch = true;
 
   const DEFAULT_HEIGHT = "70vh";
   const DEFAULT_AUTO_HEIGHT = false;
-  const DEFAULT_AUTO_MARGIN = 16;
+  const DEFAULT_AUTO_HEIGHT_MARGIN = 16;
 
   const normalizeHeight = (config) => {
     if (config?.height) return String(config.height);
-    if (config?.fixed_height !== undefined && config?.fixed_height !== null && config?.fixed_height !== "") {
-      const num = Number(config.fixed_height);
-      if (!Number.isNaN(num)) return `${Math.max(180, Math.min(2000, num))}px`;
+
+    const fixed = Number(config?.fixed_height);
+    if (!Number.isNaN(fixed) && fixed > 0) {
+      return `${Math.max(180, Math.min(2000, fixed))}px`;
     }
+
     return DEFAULT_HEIGHT;
   };
 
-  const applyScrollHeight = (instance) => {
+  const getScroller = (instance) => {
     const root = instance?.shadowRoot;
-    if (!root || !instance?._config) return;
+    if (!root) return null;
 
-    const scroller = root.querySelector(".events-scroll");
-    const events = root.querySelector(".events-scroll > .events");
-    if (!scroller || !events) return;
+    let scroller = root.querySelector(".events-scroll");
+    if (scroller) return scroller;
+
+    const content = root.getElementById("content");
+    const events = content?.querySelector(":scope > .events") || root.querySelector(".events");
+    if (!content || !events || events.parentElement?.classList?.contains("events-scroll")) {
+      return events?.parentElement?.classList?.contains("events-scroll") ? events.parentElement : null;
+    }
+
+    scroller = document.createElement("div");
+    scroller.className = "events-scroll";
+    events.parentNode.insertBefore(scroller, events);
+    scroller.appendChild(events);
+    return scroller;
+  };
+
+  const applyScrollHeight = (instance) => {
+    const scroller = getScroller(instance);
+    if (!scroller || !instance?._config) return;
+
+    const events = scroller.querySelector(".events");
 
     scroller.style.overflowY = "auto";
     scroller.style.overflowX = "hidden";
     scroller.style.overscrollBehavior = "contain";
-    scroller.style.scrollbarWidth = "thin";
-    scroller.style.paddingRight = "4px";
     scroller.style.boxSizing = "border-box";
+    scroller.style.paddingRight = "4px";
+    scroller.style.scrollbarWidth = "thin";
 
-    events.style.height = "auto";
-    events.style.maxHeight = "none";
-    events.style.minHeight = "0";
-    events.style.overflow = "visible";
-    events.style.alignContent = "start";
-    events.style.gridAutoRows = "max-content";
+    if (events) {
+      events.style.height = "auto";
+      events.style.maxHeight = "none";
+      events.style.minHeight = "0";
+      events.style.overflow = "visible";
+      events.style.alignContent = "start";
+      events.style.gridAutoRows = "max-content";
+    }
 
-    root.querySelectorAll(".event-row").forEach((row) => {
-      row.style.flexShrink = "0";
-      row.style.minHeight = "";
+    scroller.querySelectorAll(".event-row").forEach((row) => {
       row.style.height = "auto";
+      row.style.minHeight = "";
+      row.style.flexShrink = "0";
     });
 
     if (instance._config.auto_height === true) {
       const rect = scroller.getBoundingClientRect();
-      const margin = Number(instance._config.auto_height_margin ?? DEFAULT_AUTO_MARGIN);
+      const margin = Number(instance._config.auto_height_margin ?? DEFAULT_AUTO_HEIGHT_MARGIN);
       const available = Math.floor(window.innerHeight - rect.top - margin);
       scroller.style.height = `${Math.max(180, available)}px`;
       scroller.style.maxHeight = "none";
@@ -61,8 +83,8 @@ if (Card && !Card.__hikvisionScrollWrapperPatch) {
 
   const scheduleScrollHeight = (instance) => {
     if (!instance) return;
-    clearTimeout(instance._hikvisionScrollHeightTimer);
-    instance._hikvisionScrollHeightTimer = setTimeout(() => applyScrollHeight(instance), 60);
+    clearTimeout(instance.__hikvisionSafeScrollTimer);
+    instance.__hikvisionSafeScrollTimer = setTimeout(() => applyScrollHeight(instance), 60);
   };
 
   const wrapAfterRender = (name) => {
@@ -76,22 +98,7 @@ if (Card && !Card.__hikvisionScrollWrapperPatch) {
     };
   };
 
-  const originalContentHtml = Card.prototype._contentHtml;
-  if (typeof originalContentHtml === "function") {
-    Card.prototype._contentHtml = function (...args) {
-      const html = originalContentHtml.apply(this, args);
-      if (typeof html !== "string") return html;
-      if (!html.includes('class="events"')) return html;
-      if (html.includes('class="events-scroll"')) return html;
-      return html.replace(
-        /<div class="events">([\s\S]*)<\/div>\s*$/,
-        '<div class="events-scroll"><div class="events">$1</div></div>'
-      );
-    };
-  }
-
-  const originalGetCardSize = Card.prototype.getCardSize;
-  Card.prototype.getCardSize = function (...args) {
+  Card.prototype.getCardSize = function () {
     return 8;
   };
 
@@ -100,7 +107,7 @@ if (Card && !Card.__hikvisionScrollWrapperPatch) {
     ...(originalGetStubConfig ? originalGetStubConfig() : {}),
     height: DEFAULT_HEIGHT,
     auto_height: DEFAULT_AUTO_HEIGHT,
-    auto_height_margin: DEFAULT_AUTO_MARGIN,
+    auto_height_margin: DEFAULT_AUTO_HEIGHT_MARGIN,
   });
 
   const originalGetConfigForm = Card.getConfigForm?.bind(Card);
@@ -125,15 +132,15 @@ if (Card && !Card.__hikvisionScrollWrapperPatch) {
       form.computeLabel = (schema) => {
         if (schema?.name === "height") return "Altura da lista";
         if (schema?.name === "auto_height") return "Altura automática";
-        if (schema?.name === "auto_height_margin") return "Margem da altura automática";
+        if (schema?.name === "auto_height_margin") return "Margem inferior";
         return originalComputeLabel?.(schema);
       };
 
       const originalComputeHelper = form.computeHelper;
       form.computeHelper = (schema) => {
-        if (schema?.name === "height") return "Altura do bloco rolável de eventos quando a altura automática estiver desligada. Exemplo: 70vh, 520px, 40rem.";
-        if (schema?.name === "auto_height") return "Calcula a altura do bloco rolável de eventos usando a tela disponível.";
-        if (schema?.name === "auto_height_margin") return "Espaço em pixels para deixar livre no fim da tela no modo automático.";
+        if (schema?.name === "height") return "Altura do bloco rolável quando a altura automática estiver desligada. Exemplo: 70vh, 520px, 40rem.";
+        if (schema?.name === "auto_height") return "Calcula a altura do bloco rolável usando a tela disponível, igual ao Blue Iris card.";
+        if (schema?.name === "auto_height_margin") return "Espaço livre em pixels no fim da tela quando a altura automática estiver ligada.";
         return originalComputeHelper?.(schema);
       };
 
@@ -147,7 +154,7 @@ if (Card && !Card.__hikvisionScrollWrapperPatch) {
       const next = {
         height: DEFAULT_HEIGHT,
         auto_height: DEFAULT_AUTO_HEIGHT,
-        auto_height_margin: DEFAULT_AUTO_MARGIN,
+        auto_height_margin: DEFAULT_AUTO_HEIGHT_MARGIN,
         ...(config || {}),
       };
 
@@ -160,28 +167,28 @@ if (Card && !Card.__hikvisionScrollWrapperPatch) {
   Card.prototype.connectedCallback = function (...args) {
     const result = originalConnectedCallback?.apply(this, args);
 
-    if (!this._hikvisionScrollHeightOnResize) {
-      this._hikvisionScrollHeightOnResize = () => scheduleScrollHeight(this);
+    if (!this.__hikvisionSafeScrollResize) {
+      this.__hikvisionSafeScrollResize = () => scheduleScrollHeight(this);
     }
 
-    window.addEventListener("focus", this._hikvisionScrollHeightOnResize);
-    window.addEventListener("pageshow", this._hikvisionScrollHeightOnResize);
-    window.addEventListener("resize", this._hikvisionScrollHeightOnResize);
-    window.addEventListener("orientationchange", this._hikvisionScrollHeightOnResize);
+    window.addEventListener("focus", this.__hikvisionSafeScrollResize);
+    window.addEventListener("pageshow", this.__hikvisionSafeScrollResize);
+    window.addEventListener("resize", this.__hikvisionSafeScrollResize);
+    window.addEventListener("orientationchange", this.__hikvisionSafeScrollResize);
     scheduleScrollHeight(this);
     return result;
   };
 
   const originalDisconnectedCallback = Card.prototype.disconnectedCallback;
   Card.prototype.disconnectedCallback = function (...args) {
-    if (this._hikvisionScrollHeightOnResize) {
-      window.removeEventListener("focus", this._hikvisionScrollHeightOnResize);
-      window.removeEventListener("pageshow", this._hikvisionScrollHeightOnResize);
-      window.removeEventListener("resize", this._hikvisionScrollHeightOnResize);
-      window.removeEventListener("orientationchange", this._hikvisionScrollHeightOnResize);
+    if (this.__hikvisionSafeScrollResize) {
+      window.removeEventListener("focus", this.__hikvisionSafeScrollResize);
+      window.removeEventListener("pageshow", this.__hikvisionSafeScrollResize);
+      window.removeEventListener("resize", this.__hikvisionSafeScrollResize);
+      window.removeEventListener("orientationchange", this.__hikvisionSafeScrollResize);
     }
 
-    clearTimeout(this._hikvisionScrollHeightTimer);
+    clearTimeout(this.__hikvisionSafeScrollTimer);
     return originalDisconnectedCallback?.apply(this, args);
   };
 
