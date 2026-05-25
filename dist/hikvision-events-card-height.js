@@ -2,133 +2,49 @@ import "./hikvision-events-card.js";
 
 const Card = customElements.get("hikvision-events-card");
 
-if (Card && !Card.__hikvisionHeightPatchV2) {
-  Card.__hikvisionHeightPatchV2 = true;
+if (Card && !Card.__hikvisionBlueIrisHeightPatch) {
+  Card.__hikvisionBlueIrisHeightPatch = true;
 
-  const clampHeight = (value) => {
+  const toFixedHeight = (value) => {
     const num = Number(value);
-    if (Number.isNaN(num)) return 620;
-    return Math.max(260, Math.min(2200, num));
+    if (Number.isNaN(num)) return "70vh";
+    return `${Math.max(180, Math.min(2000, num))}px`;
   };
 
-  const px = (value) => {
-    const num = Number.parseFloat(value);
-    return Number.isNaN(num) ? 0 : num;
+  const configuredHeight = (config) => {
+    if (config?.height) return String(config.height);
+    if (config?.fixed_height) return toFixedHeight(config.fixed_height);
+    return "70vh";
   };
 
-  const resetLayout = (instance) => {
-    const root = instance?.shadowRoot;
-    if (!root) return;
+  const applyListHeight = (instance) => {
+    const list = instance?.shadowRoot?.querySelector(".events");
+    if (!list || !instance?._config) return;
 
-    const card = root.querySelector("ha-card");
-    const wrap = root.querySelector(".wrap");
-    const content = root.querySelector("#content");
-    const events = root.querySelector(".events");
+    list.style.overflowY = "auto";
+    list.style.overflowX = "hidden";
+    list.style.overscrollBehavior = "contain";
+    list.style.scrollbarWidth = "thin";
+    list.style.paddingRight = "4px";
 
-    instance.style.maxHeight = "";
-    instance.style.height = "";
-
-    if (card) {
-      card.style.height = "";
-      card.style.maxHeight = "";
-      card.style.overflow = "hidden";
+    if (instance._config.auto_height === true) {
+      const rect = list.getBoundingClientRect();
+      const margin = Number(instance._config.auto_height_margin ?? 16);
+      const available = Math.floor(window.innerHeight - rect.top - margin);
+      const minHeight = 180;
+      list.style.height = `${Math.max(minHeight, available)}px`;
+      list.style.maxHeight = "none";
+      return;
     }
 
-    if (wrap) {
-      wrap.style.height = "";
-      wrap.style.maxHeight = "";
-      wrap.style.minHeight = "0";
-      wrap.style.display = "";
-      wrap.style.flexDirection = "";
-      wrap.style.overflow = "";
-      wrap.style.boxSizing = "border-box";
-    }
-
-    if (content) {
-      content.style.height = "";
-      content.style.maxHeight = "";
-      content.style.minHeight = "0";
-      content.style.overflow = "hidden";
-    }
-
-    if (events) {
-      events.style.height = "";
-      events.style.maxHeight = "";
-      events.style.minHeight = "0";
-      events.style.overflowY = "auto";
-      events.style.overflowX = "hidden";
-      events.style.overscrollBehavior = "contain";
-      events.style.paddingRight = "4px";
-      events.style.scrollbarWidth = "thin";
-    }
+    list.style.height = configuredHeight(instance._config);
+    list.style.maxHeight = "none";
   };
 
-  const applyHeight = (instance) => {
-    const root = instance?.shadowRoot;
-    if (!root || !instance._config) return;
-
-    const card = root.querySelector("ha-card");
-    const wrap = root.querySelector(".wrap");
-    const content = root.querySelector("#content");
-    const events = root.querySelector(".events");
-
-    if (!card || !wrap || !content) return;
-
-    resetLayout(instance);
-
-    const fixedHeight = clampHeight(instance._config.fixed_height);
-    const viewportHeight = window.innerHeight || document.documentElement.clientHeight || 800;
-    const bottomGap = 12;
-    const cardTop = Math.max(0, card.getBoundingClientRect().top);
-
-    const targetCardHeight = instance._config.auto_height === false
-      ? fixedHeight
-      : Math.max(260, Math.floor(viewportHeight - cardTop - bottomGap));
-
-    instance.style.display = "block";
-    instance.style.height = `${targetCardHeight}px`;
-    instance.style.maxHeight = `${targetCardHeight}px`;
-
-    card.style.height = `${targetCardHeight}px`;
-    card.style.maxHeight = `${targetCardHeight}px`;
-    card.style.overflow = "hidden";
-
-    wrap.style.boxSizing = "border-box";
-    wrap.style.height = "100%";
-    wrap.style.maxHeight = "100%";
-    wrap.style.minHeight = "0";
-    wrap.style.display = "flex";
-    wrap.style.flexDirection = "column";
-    wrap.style.overflow = "hidden";
-
-    content.style.flex = "1 1 auto";
-    content.style.minHeight = "0";
-    content.style.height = "auto";
-    content.style.maxHeight = "none";
-    content.style.overflow = "hidden";
-
-    if (events) {
-      events.style.height = "100%";
-      events.style.maxHeight = "100%";
-      events.style.minHeight = "0";
-      events.style.overflowY = "auto";
-      events.style.overflowX = "hidden";
-      events.style.overscrollBehavior = "contain";
-      events.style.paddingRight = "4px";
-      events.style.scrollbarWidth = "thin";
-    } else {
-      content.style.overflowY = "auto";
-    }
-  };
-
-  const scheduleHeight = (instance) => {
-    if (!instance || instance.__hikvisionHeightFrame) return;
-
-    instance.__hikvisionHeightFrame = requestAnimationFrame(() => {
-      instance.__hikvisionHeightFrame = null;
-      applyHeight(instance);
-      requestAnimationFrame(() => applyHeight(instance));
-    });
+  const scheduleListHeight = (instance) => {
+    if (!instance) return;
+    clearTimeout(instance._heightTimer);
+    instance._heightTimer = setTimeout(() => applyListHeight(instance), 60);
   };
 
   const wrapAfterRender = (name) => {
@@ -137,23 +53,21 @@ if (Card && !Card.__hikvisionHeightPatchV2) {
 
     Card.prototype[name] = function (...args) {
       const result = original.apply(this, args);
-      scheduleHeight(this);
+      scheduleListHeight(this);
       return result;
     };
   };
 
-  const originalGetCardSize = Card.prototype.getCardSize;
-  Card.prototype.getCardSize = function (...args) {
-    if (this?._config?.auto_height !== false) return 6;
-    const fixedHeight = clampHeight(this?._config?.fixed_height);
-    return Math.max(3, Math.ceil(fixedHeight / 50));
+  Card.prototype.getCardSize = function () {
+    return 8;
   };
 
   const originalGetStubConfig = Card.getStubConfig?.bind(Card);
   Card.getStubConfig = () => ({
     ...(originalGetStubConfig ? originalGetStubConfig() : {}),
-    auto_height: true,
-    fixed_height: 620,
+    height: "70vh",
+    auto_height: false,
+    auto_height_margin: 16,
   });
 
   const originalGetConfigForm = Card.getConfigForm?.bind(Card);
@@ -168,22 +82,25 @@ if (Card && !Card.__hikvisionHeightPatchV2) {
         options.splice(
           insertAt,
           0,
+          { name: "height", selector: { text: {} } },
           { name: "auto_height", selector: { boolean: {} } },
-          { name: "fixed_height", selector: { number: { min: 260, max: 2200, mode: "box", step: 10, unit_of_measurement: "px" } } }
+          { name: "auto_height_margin", selector: { number: { min: 0, max: 300, mode: "box", step: 1, unit_of_measurement: "px" } } }
         );
       }
 
       const originalComputeLabel = form.computeLabel;
       form.computeLabel = (schema) => {
+        if (schema?.name === "height") return "Altura";
         if (schema?.name === "auto_height") return "Altura automática";
-        if (schema?.name === "fixed_height") return "Altura fixa do card";
+        if (schema?.name === "auto_height_margin") return "Margem da altura automática";
         return originalComputeLabel?.(schema);
       };
 
       const originalComputeHelper = form.computeHelper;
       form.computeHelper = (schema) => {
-        if (schema?.name === "auto_height") return "Trava a altura total do card para caber na tela e deixa apenas a lista de eventos com rolagem.";
-        if (schema?.name === "fixed_height") return "Altura total do card em pixels quando a altura automática estiver desligada.";
+        if (schema?.name === "height") return "Altura da lista quando a altura automática estiver desligada. Exemplo: 70vh, 520px, 40rem.";
+        if (schema?.name === "auto_height") return "Igual ao Blue Iris: calcula a altura da lista usando a tela disponível.";
+        if (schema?.name === "auto_height_margin") return "Espaço em pixels para deixar livre no fim da tela no modo automático.";
         return originalComputeHelper?.(schema);
       };
 
@@ -194,11 +111,15 @@ if (Card && !Card.__hikvisionHeightPatchV2) {
   const originalSetConfig = Card.prototype.setConfig;
   if (typeof originalSetConfig === "function") {
     Card.prototype.setConfig = function (config) {
-      return originalSetConfig.call(this, {
-        auto_height: true,
-        fixed_height: 620,
+      const next = {
+        height: "70vh",
+        auto_height: false,
+        auto_height_margin: 16,
         ...(config || {}),
-      });
+      };
+
+      if (next.fixed_height && !next.height) next.height = toFixedHeight(next.fixed_height);
+      return originalSetConfig.call(this, next);
     };
   }
 
@@ -206,28 +127,28 @@ if (Card && !Card.__hikvisionHeightPatchV2) {
   Card.prototype.connectedCallback = function (...args) {
     const result = originalConnectedCallback?.apply(this, args);
 
-    if (!this.__hikvisionHeightResize) {
-      this.__hikvisionHeightResize = () => scheduleHeight(this);
+    if (!this._hikvisionHeightOnResize) {
+      this._hikvisionHeightOnResize = () => scheduleListHeight(this);
     }
 
-    window.addEventListener("resize", this.__hikvisionHeightResize);
-    window.addEventListener("orientationchange", this.__hikvisionHeightResize);
-    scheduleHeight(this);
+    window.addEventListener("focus", this._hikvisionHeightOnResize);
+    window.addEventListener("pageshow", this._hikvisionHeightOnResize);
+    window.addEventListener("resize", this._hikvisionHeightOnResize);
+    window.addEventListener("orientationchange", this._hikvisionHeightOnResize);
+    scheduleListHeight(this);
     return result;
   };
 
   const originalDisconnectedCallback = Card.prototype.disconnectedCallback;
   Card.prototype.disconnectedCallback = function (...args) {
-    if (this.__hikvisionHeightResize) {
-      window.removeEventListener("resize", this.__hikvisionHeightResize);
-      window.removeEventListener("orientationchange", this.__hikvisionHeightResize);
+    if (this._hikvisionHeightOnResize) {
+      window.removeEventListener("focus", this._hikvisionHeightOnResize);
+      window.removeEventListener("pageshow", this._hikvisionHeightOnResize);
+      window.removeEventListener("resize", this._hikvisionHeightOnResize);
+      window.removeEventListener("orientationchange", this._hikvisionHeightOnResize);
     }
 
-    if (this.__hikvisionHeightFrame) {
-      cancelAnimationFrame(this.__hikvisionHeightFrame);
-      this.__hikvisionHeightFrame = null;
-    }
-
+    clearTimeout(this._heightTimer);
     return originalDisconnectedCallback?.apply(this, args);
   };
 
