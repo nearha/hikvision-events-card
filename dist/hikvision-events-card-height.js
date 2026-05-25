@@ -6,7 +6,7 @@ if (Card && !Card.__hikvisionSafeScrollPatch) {
   Card.__hikvisionSafeScrollPatch = true;
 
   const DEFAULT_HEIGHT = "70vh";
-  const DEFAULT_AUTO_HEIGHT = false;
+  const DEFAULT_AUTO_HEIGHT = true;
   const DEFAULT_AUTO_HEIGHT_MARGIN = 16;
 
   const normalizeHeight = (config) => {
@@ -68,7 +68,7 @@ if (Card && !Card.__hikvisionSafeScrollPatch) {
       row.style.flexShrink = "0";
     });
 
-    if (instance._config.auto_height === true) {
+    if (instance._config.auto_height !== false) {
       const rect = scroller.getBoundingClientRect();
       const margin = Number(instance._config.auto_height_margin ?? DEFAULT_AUTO_HEIGHT_MARGIN);
       const available = Math.floor(window.innerHeight - rect.top - margin);
