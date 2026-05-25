@@ -63,6 +63,14 @@ class HikvisionEventsCard extends HTMLElement {
         show_detection_image: "Mostrar imagem de detecção",
         show_plate_image: "Mostrar crop da placa",
       }[schema.name]),
+      computeHelper: (schema) => ({
+        intercom_device_ids: "Selecione os devices do intercom que tenham a entidade event de unlock.",
+        anpr_device_ids: "Selecione os devices ANPR.",
+        show_date_filters: "Exibe ou oculta o período e os atalhos de data.",
+        minimal_mode: "Mostra os eventos em formato leve, tipo log, mantendo o clique para abrir os detalhes.",
+        default_days: "Quantidade de dias carregada ao abrir o card.",
+        max_items: "Limite máximo de eventos exibidos.",
+      }[schema.name]),
     };
   }
 
@@ -80,15 +88,23 @@ class HikvisionEventsCard extends HTMLElement {
     this._historyError = null;
     this._lastLiveSignature = "";
     this._refreshTimer = null;
+    this._resolving = false;
+    this._resolvedUrlCache = new Map();
+    this._resolvePromiseCache = new Map();
+    this._imageErrorCache = new Map();
+    this._renderQueued = false;
     this._onEsc = (ev) => {
-      if (ev.key === "Escape") {
+      if (ev.key === "Escape" && this._selected) {
         this._selected = null;
         this._render();
       }
     };
   }
 
-  connectedCallback() { window.addEventListener("keydown", this._onEsc); }
+  connectedCallback() {
+    window.addEventListener("keydown", this._onEsc);
+  }
+
   disconnectedCallback() {
     window.removeEventListener("keydown", this._onEsc);
     if (this._refreshTimer) clearTimeout(this._refreshTimer);
@@ -105,6 +121,7 @@ class HikvisionEventsCard extends HTMLElement {
       intercom_device_ids: intercom,
       anpr_device_ids: anpr,
     };
+
     const range = this._defaultRange(this._config.default_days);
     this._startDate = range.start;
     this._endDate = range.end;
@@ -112,6 +129,10 @@ class HikvisionEventsCard extends HTMLElement {
     this._items = [];
     this._selected = null;
     this._historyError = null;
+    this._lastLiveSignature = "";
+    this._resolvedUrlCache.clear();
+    this._resolvePromiseCache.clear();
+    this._imageErrorCache.clear();
     this._render();
     this._ensureEntities();
   }
@@ -123,7 +144,9 @@ class HikvisionEventsCard extends HTMLElement {
     this._render();
   }
 
-  getCardSize() { return 3 + Math.min(Math.max(this._items.length, 1), 8); }
+  getCardSize() {
+    return 3 + Math.min(Math.max(this._items.length, 1), 8);
+  }
 
   async _ensureEntities() {
     if (!this._hass || !this._config || this._entities || this._resolving) return;
@@ -142,13 +165,16 @@ class HikvisionEventsCard extends HTMLElement {
 
       for (const deviceId of this._config.intercom_device_ids || []) {
         const entries = entities.filter((e) => e.device_id === deviceId && e.entity_id?.startsWith("event."));
-        const event = entries.find((e) => this._token(e.unique_id + e.entity_id + e.name + e.original_name).includes("unlock")) || entries[0];
+        const event = entries.find((e) => this._token(`${e.unique_id || ""}${e.entity_id || ""}${e.name || ""}${e.original_name || ""}`).includes("unlock")) || entries[0];
         if (event) found.push({ source: "intercom", device_id: deviceId, entity_id: event.entity_id, device_name: this._cleanName(deviceNames.get(deviceId) || event.name || event.original_name || event.entity_id) });
       }
 
       for (const deviceId of this._config.anpr_device_ids || []) {
         const entries = entities.filter((e) => e.device_id === deviceId && e.entity_id?.startsWith("event."));
-        const event = entries.find((e) => this._token(e.unique_id + e.entity_id + e.name + e.original_name).includes("anpr") || this._token(e.unique_id + e.entity_id).includes("lastevent")) || entries[0];
+        const event = entries.find((e) => {
+          const text = this._token(`${e.unique_id || ""}${e.entity_id || ""}${e.name || ""}${e.original_name || ""}`);
+          return text.includes("anpr") || text.includes("lastevent") || text.includes("last");
+        }) || entries[0];
         if (event) found.push({ source: "anpr", device_id: deviceId, entity_id: event.entity_id, device_name: this._cleanName(deviceNames.get(deviceId) || event.name || event.original_name || event.entity_id) });
       }
 
@@ -193,8 +219,9 @@ class HikvisionEventsCard extends HTMLElement {
         }
       }
 
-      items = this._dedupe(items).sort((a, b) => new Date(b.when) - new Date(a.when));
+      items = this._dedupe(items).sort((a, b) => new Date(b.when).getTime() - new Date(a.when).getTime());
       this._items = items.slice(0, Number(this._config.max_items || 50));
+      this._preResolveImages(this._items.slice(0, 20));
     } catch (err) {
       this._items = [];
       this._historyError = err?.message || String(err);
@@ -210,7 +237,7 @@ class HikvisionEventsCard extends HTMLElement {
       source: "intercom",
       entity_id: row.entity_id,
       device_name: meta.device_name,
-      when: a.event_time || a.occurred_at || a.timestamp || row.last_changed || row.last_updated,
+      when: a.event_time || a.occurred_at || a.event_timestamp || a.timestamp || row.last_changed || row.last_updated,
       unlock_type: a.unlock_type || row.state || "UNKNOWN",
       number: a.number ?? null,
       door_id: a.door_id ?? null,
@@ -227,6 +254,7 @@ class HikvisionEventsCard extends HTMLElement {
       entity_id: row.entity_id,
       device_name: meta.device_name,
       when: a.event_time || row.last_changed || row.last_updated || row.state,
+      camera_event_time: a.event_time || "",
       plate: a.plate || "—",
       confidence: a.confidence || "—",
       direction: a.direction || "—",
@@ -246,7 +274,7 @@ class HikvisionEventsCard extends HTMLElement {
     if (!this._hass || !this._entities?.length) return;
     const sig = this._entities.map((e) => {
       const s = this._hass.states[e.entity_id];
-      return s ? `${e.entity_id}|${s.last_changed}|${JSON.stringify(s.attributes || {})}` : e.entity_id;
+      return s ? `${e.entity_id}|${s.last_changed || ""}|${JSON.stringify(s.attributes || {})}` : e.entity_id;
     }).join("||");
     if (!sig || sig === this._lastLiveSignature) return;
     this._lastLiveSignature = sig;
@@ -259,13 +287,13 @@ class HikvisionEventsCard extends HTMLElement {
     const items = this._filteredItems();
     this.shadowRoot.innerHTML = `
       <style>
-        :host{display:block}ha-card{overflow:hidden}.wrap{padding:16px}.header{display:flex;justify-content:space-between;gap:12px;align-items:center;margin-bottom:12px}.title{font-size:20px;font-weight:700}.counter,.pill{border-radius:999px;background:var(--secondary-background-color);padding:6px 10px;font-size:12px}.toolbar{display:grid;gap:10px;margin-bottom:14px}.tabs,.dates,.quick,.search{display:flex;flex-wrap:wrap;gap:8px;align-items:end}button,input{font:inherit;min-height:38px;border-radius:10px;border:1px solid var(--divider-color);background:var(--card-background-color);color:var(--primary-text-color);padding:0 12px}.primary{background:var(--primary-color);color:var(--text-primary-color,#fff);border-color:var(--primary-color)}.active{border-color:var(--primary-color);color:var(--primary-color)}label{display:grid;gap:4px;color:var(--secondary-text-color);font-size:12px}.events{display:grid;gap:10px}.row{width:100%;text-align:left;padding:10px;border:1px solid var(--divider-color);border-radius:14px;background:var(--card-background-color);display:grid;grid-template-columns:112px 1fr;gap:12px}.minimal{display:block}.thumb{width:100%;height:88px;object-fit:cover;border-radius:10px;background:var(--secondary-background-color);display:flex;align-items:center;justify-content:center;color:var(--secondary-text-color);font-size:12px}.main{display:grid;gap:6px;align-content:center}.headline{font-size:22px;font-weight:800}.sub,.meta{color:var(--secondary-text-color);font-size:13px}.badges{display:flex;gap:6px;flex-wrap:wrap}.message{padding:14px;border-radius:12px;background:var(--secondary-background-color);color:var(--secondary-text-color)}.error{color:var(--error-color)}.overlay{position:fixed;inset:0;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center;padding:16px;z-index:999}.modal{width:min(1000px,calc(100vw - 32px));max-height:calc(100vh - 32px);overflow:auto;border-radius:18px;background:var(--card-background-color);color:var(--primary-text-color);padding:18px;box-shadow:0 8px 30px rgba(0,0,0,.35)}.modal-head{display:flex;justify-content:space-between;gap:12px}.modal-title{font-size:28px;font-weight:800}.grid{display:grid;grid-template-columns:280px 1fr;gap:14px;margin-top:14px}.details,.image-card{border:1px solid var(--divider-color);border-radius:14px}.details{padding:8px}.drow{display:flex;justify-content:space-between;gap:10px;padding:9px 0;border-bottom:1px solid var(--divider-color)}.drow:last-child{border-bottom:0}.images{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px}.image-card div{font-weight:700;padding:10px;border-bottom:1px solid var(--divider-color)}.image-card img{width:100%;display:block}@media(max-width:760px){.row{grid-template-columns:1fr}.grid{grid-template-columns:1fr}}
+        :host{display:block}ha-card{position:relative;overflow:hidden}.wrap{padding:16px}.header{display:flex;justify-content:space-between;gap:12px;align-items:center;margin-bottom:12px}.title{font-size:20px;font-weight:700;line-height:1.2}.counter,.pill{border-radius:999px;background:var(--secondary-background-color);padding:6px 10px;font-size:12px}.toolbar{display:grid;gap:10px;margin-bottom:14px}.tabs,.dates,.quick,.search{display:flex;flex-wrap:wrap;gap:8px;align-items:end}button,input{box-sizing:border-box;font:inherit;min-height:38px;border-radius:10px;border:1px solid var(--divider-color);background:var(--card-background-color);color:var(--primary-text-color);padding:0 12px}button{cursor:pointer}.primary{background:var(--primary-color);color:var(--text-primary-color,#fff);border-color:var(--primary-color)}.active{border-color:var(--primary-color);color:var(--primary-color);background:color-mix(in srgb,var(--primary-color) 10%,transparent)}label{display:grid;gap:4px;color:var(--secondary-text-color);font-size:12px}.search input{min-width:240px}.events{display:grid;gap:10px}.row{width:100%;text-align:left;padding:10px;border:1px solid var(--divider-color);border-radius:14px;background:var(--card-background-color);display:grid;grid-template-columns:116px 1fr;gap:12px;align-items:stretch}.minimal{display:flex;grid-template-columns:none;min-height:64px}.thumb{width:100%;height:88px;min-height:88px;object-fit:cover;border-radius:10px;background:#00000012;display:block}.thumb.placeholder{display:flex;align-items:center;justify-content:center;color:var(--secondary-text-color);font-size:12px;text-transform:uppercase}.main{min-width:0;display:grid;gap:6px;align-content:center}.headline{font-size:22px;font-weight:800;line-height:1.2}.sub,.meta{color:var(--secondary-text-color);font-size:13px}.badges{display:flex;gap:6px;flex-wrap:wrap}.pill{display:inline-flex;align-items:center;justify-content:center;border:1px solid var(--divider-color);min-height:24px;padding:0 8px;font-weight:600;color:var(--primary-text-color)}.message{padding:14px;border-radius:12px;background:var(--secondary-background-color);color:var(--secondary-text-color)}.error{color:var(--error-color)}.overlay{position:fixed;inset:0;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center;padding:16px;z-index:999}.modal{width:min(1100px,calc(100vw - 32px));max-height:calc(100vh - 32px);overflow:auto;border-radius:18px;background:var(--card-background-color);color:var(--primary-text-color);padding:18px;box-shadow:0 8px 30px rgba(0,0,0,.35)}.modal-head{display:flex;justify-content:space-between;gap:12px;align-items:start}.modal-title{font-size:28px;font-weight:800;line-height:1.1}.grid{display:grid;grid-template-columns:300px 1fr;gap:16px;margin-top:14px}.details,.image-card{border:1px solid var(--divider-color);border-radius:14px;background:var(--card-background-color)}.details{padding:8px;align-self:start}.drow{display:flex;justify-content:space-between;gap:10px;padding:10px 0;border-bottom:1px solid var(--divider-color);font-size:14px}.drow:last-child{border-bottom:0}.drow span{color:var(--secondary-text-color)}.images{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px}.image-card div{font-weight:700;padding:10px 12px;border-bottom:1px solid var(--divider-color)}.image-card img{width:100%;height:auto;display:block;background:#00000012}.image-card .missing{min-height:180px;display:flex;align-items:center;justify-content:center;color:var(--secondary-text-color);padding:16px}@media(max-width:800px){.row{grid-template-columns:1fr}.grid{grid-template-columns:1fr}.modal-title{font-size:22px}}
       </style>
       <ha-card><div class="wrap">
         ${this._config.show_title === false ? "" : `<div class="header"><div class="title">${this._esc(this._config.title || "Eventos Hikvision")}</div><div class="counter">${items.length} evento(s)</div></div>`}
         <div class="toolbar">
           ${this._tabsHtml()}
-          ${this._config.show_date_filters ? `<div class="dates"><label>De<input id="start" type="date" value="${this._esc(this._startDate)}"></label><label>Até<input id="end" type="date" value="${this._esc(this._endDate)}"></label><button class="primary" id="filter">Filtrar</button></div><div class="quick"><button data-days="1">Hoje</button><button data-days="7">7 dias</button><button data-days="30">30 dias</button></div>` : ""}
+          ${this._config.show_date_filters ? `<div class="dates"><label><span>De</span><input id="start" type="date" value="${this._esc(this._startDate)}"></label><label><span>Até</span><input id="end" type="date" value="${this._esc(this._endDate)}"></label><button class="primary" id="filter">Filtrar</button></div><div class="quick"><button data-days="1">Hoje</button><button data-days="7">7 dias</button><button data-days="30">30 dias</button></div>` : ""}
           ${this._config.show_search ? `<div class="search"><input id="search" type="search" placeholder="Buscar evento..." value="${this._esc(this._searchFilter)}"></div>` : ""}
         </div>
         <div>${this._contentHtml(items)}</div>
@@ -288,15 +316,14 @@ class HikvisionEventsCard extends HTMLElement {
   _rowHtml(item) {
     const title = item.source === "intercom" ? this._displayName(item) : this._text(item.plate);
     const sub = `${this._text(item.device_name)} • ${this._formatDate(item.when)}`;
-    const img = this._imageUrl(this._primaryImage(item));
-    const thumb = img ? `<img class="thumb" src="${this._esc(img)}" loading="lazy" alt="${this._esc(title)}">` : `<div class="thumb">sem imagem</div>`;
+    const thumb = this._config.minimal_mode ? "" : this._renderRowImage(this._primaryImage(item), title);
     const badges = item.source === "intercom"
-      ? `<span class="pill">${this._unlockLabel(item.unlock_type)}</span>${item.door_id ? `<span class="pill">Porta ${this._esc(item.door_id)}</span>` : ""}`
-      : `<span class="pill">${this._listLabel(item.list_result)}</span><span class="pill">${this._direction(item.direction)}</span><span class="pill">${this._confidence(item.confidence)}</span>`;
+      ? `<span class="pill">${this._esc(this._unlockLabel(item.unlock_type))}</span>${this._hasValue(item.door_id) ? `<span class="pill">Porta ${this._esc(item.door_id)}</span>` : ""}`
+      : `<span class="pill">${this._esc(this._listLabel(item.list_result))}</span><span class="pill">${this._esc(this._direction(item.direction))}</span><span class="pill">${this._esc(this._confidence(item.confidence))}</span>`;
     const meta = item.source === "intercom"
-      ? `Nome: ${this._esc(title)}${item.card_user_id ? ` • Card User ID: ${this._esc(item.card_user_id)}` : ""}`
-      : `Marca: ${this._esc(this._text(item.brand))} • Tipo: ${this._esc(this._text(item.type))} • Cor: ${this._esc(this._text(item.color))}`;
-    return `<button class="row ${this._config.minimal_mode ? "minimal" : ""}" data-key="${this._esc(this._key(item))}">${this._config.minimal_mode ? "" : thumb}<div class="main"><div class="headline">${this._esc(title)}</div><div class="sub">${this._esc(sub)}</div><div class="badges">${badges}</div><div class="meta">${meta}</div></div></button>`;
+      ? `Nome: ${this._esc(title)}${this._hasValue(item.card_user_id) ? ` • Card User ID: ${this._esc(item.card_user_id)}` : ""}`
+      : `Marca: ${this._esc(this._text(item.brand))} • Tipo: ${this._esc(this._vehicleType(item.type))} • Cor: ${this._esc(this._colorLabel(item.color))}`;
+    return `<button class="row ${this._config.minimal_mode ? "minimal" : ""}" data-key="${this._esc(this._key(item))}">${thumb}<div class="main"><div class="headline">${this._esc(title)}</div><div class="sub">${this._esc(sub)}</div><div class="badges">${badges}</div><div class="meta">${meta}</div></div></button>`;
   }
 
   _modalHtml() {
@@ -306,13 +333,10 @@ class HikvisionEventsCard extends HTMLElement {
     const details = item.source === "intercom" ? [
       ["Tipo", this._unlockLabel(item.unlock_type)], ["Exibição", title], ["Device", item.device_name], ["Porta", item.door_id], ["Data", this._formatDate(item.when)], ["Card User ID", item.card_user_id]
     ] : [
-      ["Marca", item.brand], ["Tipo", item.type], ["Cor", item.color], ["País", item.country], ["Direção", this._direction(item.direction)], ["Confidence", this._confidence(item.confidence)]
+      ["Marca", item.brand], ["Tipo", this._vehicleType(item.type)], ["Cor", this._colorLabel(item.color)], ["País", item.country], ["Direção", this._direction(item.direction)], ["Confidence", this._confidence(item.confidence)]
     ];
-    const images = this._imagesFor(item).map(([name, path]) => {
-      const url = this._imageUrl(path);
-      return `<div class="image-card"><div>${this._esc(name)}</div>${url ? `<img src="${this._esc(url)}" alt="${this._esc(name)}">` : `<p class="message">Imagem não disponível</p>`}</div>`;
-    }).join("");
-    return `<div class="overlay" id="overlay"><div class="modal" role="dialog" aria-modal="true"><div class="modal-head"><div><div class="modal-title">${this._esc(title)}</div><div class="sub">${this._esc(this._text(item.device_name))} • ${this._esc(this._formatDate(item.when))}</div></div><button id="close">✕</button></div><div class="grid"><div class="details">${details.map(([k,v]) => `<div class="drow"><span>${this._esc(k)}</span><strong>${this._esc(this._text(v))}</strong></div>`).join("")}</div><div class="images">${images}</div></div></div></div>`;
+    const images = this._imagesFor(item).map(([name, path]) => this._renderDetailImage(name, path)).join("");
+    return `<div class="overlay" id="overlay"><div class="modal" role="dialog" aria-modal="true"><div class="modal-head"><div><div class="modal-title">${this._esc(title)}</div><div class="sub">${this._esc(this._text(item.device_name))} • ${this._esc(this._formatDate(item.when))}</div></div><button id="close" aria-label="Fechar">✕</button></div><div class="grid"><div class="details">${details.map(([k,v]) => `<div class="drow"><span>${this._esc(k)}</span><strong>${this._esc(this._text(v))}</strong></div>`).join("")}</div><div class="images">${images}</div></div></div></div>`;
   }
 
   _bind() {
@@ -321,7 +345,7 @@ class HikvisionEventsCard extends HTMLElement {
       this._render();
     });
     this.shadowRoot.querySelectorAll("[data-tab]").forEach((el) => el.onclick = () => {
-      this._activeTab = el.dataset.tab;
+      this._activeTab = el.dataset.tab || "all";
       this._render();
     });
     const filter = this.shadowRoot.getElementById("filter");
@@ -345,7 +369,10 @@ class HikvisionEventsCard extends HTMLElement {
   }
 
   _tabsHtml() {
-    if (!(this._config.show_tabs && this._config.intercom_device_ids?.length && this._config.anpr_device_ids?.length)) return "";
+    if (!(this._config.show_tabs && this._config.intercom_device_ids?.length && this._config.anpr_device_ids?.length)) {
+      this._activeTab = "all";
+      return "";
+    }
     return `<div class="tabs">${[["all","Todos"],["intercom","Intercom"],["anpr","ANPR"]].map(([k,l]) => `<button class="${this._activeTab === k ? "active" : ""}" data-tab="${k}">${l}</button>`).join("")}</div>`;
   }
 
@@ -354,15 +381,120 @@ class HikvisionEventsCard extends HTMLElement {
     if (this._activeTab !== "all") items = items.filter((i) => i.source === this._activeTab);
     const q = this._searchFilter.trim().toLowerCase();
     if (!q) return items;
-    return items.filter((i) => JSON.stringify(i).toLowerCase().includes(q));
+    return items.filter((i) => this._searchText(i).includes(q));
   }
 
-  _imageUrl(path) {
-    const p = String(path || "").replaceAll("\\", "/").trim();
+  _searchText(item) {
+    return [
+      item.source, item.entity_id, item.device_name, item.when, item.unlock_type, item.number,
+      item.door_id, item.card_user_id, item.plate, item.confidence, item.direction, item.list_result,
+      item.country, item.brand, item.type, item.color, this._formatDate(item.when)
+    ].map((x) => this._text(x, "")).join(" ").toLowerCase();
+  }
+
+  _normalizePath(path) {
+    return String(path || "").replaceAll("\\", "/").trim();
+  }
+
+  _pathToDirectUrl(path) {
+    const p = this._normalizePath(path);
     if (!p) return null;
     if (/^(https?:|data:|blob:|\/local\/)/.test(p)) return p;
-    if (p.startsWith("/config/www/")) return `/local/${encodeURI(p.slice(12))}`;
+    if (p.startsWith("/config/www/")) return `/local/${encodeURI(p.slice("/config/www/".length))}`;
     return null;
+  }
+
+  _pathToMediaSourceId(path) {
+    const p = this._normalizePath(path);
+    if (!p) return null;
+    if (p.startsWith("media-source://")) return p;
+    if (p.startsWith("/media/")) return `media-source://media_source/local/${p.slice("/media/".length)}`;
+    return null;
+  }
+
+  async _resolveMediaPath(path) {
+    const p = this._normalizePath(path);
+    if (!p || !this._hass) return null;
+    const direct = this._pathToDirectUrl(p);
+    if (direct) return direct;
+    const mediaContentId = this._pathToMediaSourceId(p);
+    if (!mediaContentId) throw new Error("unsupported_path");
+    const response = await this._hass.callWS({
+      type: "media_source/resolve_media",
+      media_content_id: mediaContentId,
+      expires: 3600,
+    });
+    return response?.url || null;
+  }
+
+  _preResolveImages(items) {
+    for (const item of items) {
+      for (const [, path] of this._imagesFor(item)) this._ensureResolvedImage(path);
+    }
+  }
+
+  _ensureResolvedImage(path) {
+    const p = this._normalizePath(path);
+    if (!p || this._resolvedUrlCache.has(p) || this._resolvePromiseCache.has(p)) return;
+    const direct = this._pathToDirectUrl(p);
+    if (direct) {
+      this._resolvedUrlCache.set(p, direct);
+      return;
+    }
+    const promise = this._resolveMediaPath(p)
+      .then((url) => {
+        if (!url) throw new Error("empty_resolved_url");
+        this._resolvedUrlCache.set(p, url);
+        this._imageErrorCache.delete(p);
+        this._queueRender();
+        return url;
+      })
+      .catch((err) => {
+        this._imageErrorCache.set(p, err?.message || String(err));
+        this._queueRender();
+        return null;
+      })
+      .finally(() => this._resolvePromiseCache.delete(p));
+    this._resolvePromiseCache.set(p, promise);
+  }
+
+  _getImageState(path) {
+    const p = this._normalizePath(path);
+    if (!p) return { kind: "missing", src: null };
+    const direct = this._pathToDirectUrl(p);
+    if (direct) return { kind: "ready", src: direct };
+    const cached = this._resolvedUrlCache.get(p);
+    if (cached) return { kind: "ready", src: cached };
+    const err = this._imageErrorCache.get(p);
+    if (err) return { kind: "error", src: null, error: err };
+    this._ensureResolvedImage(p);
+    return { kind: "loading", src: null };
+  }
+
+  _renderRowImage(path, alt) {
+    const state = this._getImageState(path);
+    if (state.kind === "ready" && state.src) return `<img class="thumb" src="${this._esc(state.src)}" alt="${this._esc(alt)}" loading="lazy">`;
+    if (state.kind === "loading") return `<div class="thumb placeholder">carregando…</div>`;
+    if (state.kind === "error") return `<div class="thumb placeholder">erro imagem</div>`;
+    return `<div class="thumb placeholder">sem imagem</div>`;
+  }
+
+  _renderDetailImage(title, path) {
+    const state = this._getImageState(path);
+    const head = `<div>${this._esc(title)}</div>`;
+    if (state.kind === "ready" && state.src) return `<div class="image-card">${head}<img src="${this._esc(state.src)}" alt="${this._esc(title)}"></div>`;
+    if (state.kind === "loading") return `<div class="image-card">${head}<div class="missing">Carregando imagem…</div></div>`;
+    if (state.kind === "error") return `<div class="image-card">${head}<div class="missing">Erro ao carregar imagem</div></div>`;
+    return `<div class="image-card">${head}<div class="missing">Imagem não disponível</div></div>`;
+  }
+
+  _queueRender() {
+    if (this._renderQueued) return;
+    this._renderQueued = true;
+    requestAnimationFrame(() => {
+      this._renderQueued = false;
+      this._render();
+    });
   }
 
   _imagesFor(item) {
@@ -371,29 +503,43 @@ class HikvisionEventsCard extends HTMLElement {
     if (this._config.show_detection_image) out.push(["Detecção", item.detection_image_path]);
     if (this._config.show_plate_image) out.push(["Placa", item.license_plate_image_path]);
     if (this._config.show_vehicle_image) out.push(["Veículo", item.vehicle_image_path]);
+    if (!out.length) {
+      if (item.detection_image_path) out.push(["Detecção", item.detection_image_path]);
+      if (item.license_plate_image_path) out.push(["Placa", item.license_plate_image_path]);
+      if (item.vehicle_image_path) out.push(["Veículo", item.vehicle_image_path]);
+    }
     return out;
   }
 
-  _primaryImage(item) { return this._imagesFor(item).map((x) => x[1]).find(Boolean); }
+  _primaryImage(item) {
+    return this._imagesFor(item).map((x) => x[1]).find((p) => this._hasValue(p));
+  }
+
   _hasConfig() { return Boolean(this._config?.intercom_device_ids?.length || this._config?.anpr_device_ids?.length); }
-  _defaultRange(days) { const end = new Date(); const start = new Date(); start.setHours(0,0,0,0); start.setDate(start.getDate() - Math.max((Number(days) || 1) - 1, 0)); return { start: this._dateInput(start), end: this._dateInput(end) }; }
-  _dateInput(d) { return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`; }
-  _startOfDay(v) { const d = new Date(`${v}T00:00:00`); return Number.isNaN(d) ? null : d; }
-  _endOfDay(v) { const d = new Date(`${v}T23:59:59.999`); return Number.isNaN(d) ? null : d; }
+  _defaultRange(days) { const end = new Date(); const start = new Date(); start.setHours(0, 0, 0, 0); start.setDate(start.getDate() - Math.max((Number(days) || 1) - 1, 0)); return { start: this._dateInput(start), end: this._dateInput(end) }; }
+  _dateInput(d) { return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`; }
+  _startOfDay(v) { const d = new Date(`${v}T00:00:00`); return Number.isNaN(d.getTime()) ? null : d; }
+  _endOfDay(v) { const d = new Date(`${v}T23:59:59.999`); return Number.isNaN(d.getTime()) ? null : d; }
   _formatDate(v) { const d = new Date(v); return Number.isNaN(d.getTime()) ? this._text(v) : new Intl.DateTimeFormat(this._hass?.locale?.language || "pt-BR", { dateStyle: "short", timeStyle: "medium" }).format(d); }
   _token(v) { return String(v || "").toLowerCase().replace(/[_\-\s]/g, ""); }
-  _text(v, fallback = "—") { if (v === undefined || v === null) return fallback; const s = String(v).trim(); return !s || ["unknown","unkown","unavailable","none","null","0","not supported by the algorithm"].includes(s.toLowerCase()) ? fallback : s; }
+  _hasValue(v) { return this._text(v, "") !== ""; }
+  _text(v, fallback = "—") { if (v === undefined || v === null) return fallback; const s = String(v).trim(); return !s || ["unknown", "unkown", "unknown_state", "unavailable", "none", "null", "0", "—", "not supported by the algorithm"].includes(s.toLowerCase()) ? fallback : s; }
   _cleanName(v) { return this._text(v, "Device").replace(/\s+(Unlock|Ring|Call|ANPR)$/i, ""); }
-  _esc(v) { return String(v ?? "").replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;").replaceAll('"',"&quot;").replaceAll("'","&#039;"); }
-  _unlockType(v) { return String(v || "UNKNOWN").trim().toUpperCase().replaceAll("-","_").replaceAll(" ","_"); }
-  _unlockLabel(v) { return { FACE:"Facial", FINGERPRINT:"Digital", CARD:"Cartão", QR:"QR", QR_CODE:"QR", PASSWORD:"Senha", HOUSEHOLDER:"Interfone", CENTER_PLATFORM:"Central" }[this._unlockType(v)] || "Desconhecido"; }
+  _esc(v) { return String(v ?? "").replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;").replaceAll("'", "&#039;"); }
+  _unlockType(v) { return String(v || "UNKNOWN").trim().toUpperCase().replaceAll("-", "_").replaceAll(" ", "_"); }
+  _unlockLabel(v) { return { FACE: "Facial", FINGERPRINT: "Digital", CARD: "Cartão", QR: "QR", QR_CODE: "QR", PASSWORD: "Senha", HOUSEHOLDER: "Interfone", CENTER_PLATFORM: "Central" }[this._unlockType(v)] || "Desconhecido"; }
   _displayName(item) { const n = this._text(item.number, ""); const t = this._unlockType(item.unlock_type); if (t === "HOUSEHOLDER") return n ? `Tela ${n}` : "Tela"; if (t === "CENTER_PLATFORM") return "Central"; return n || this._unlockLabel(t); }
-  _direction(v) { const t = this._token(v); if (["in","entry","enter","forward"].some((x) => t.includes(x))) return "Entrando"; if (["out","exit","reverse"].some((x) => t.includes(x))) return "Saindo"; return this._text(v); }
+  _direction(v) { const t = this._token(v); if (["in", "entry", "enter", "forward"].some((x) => t.includes(x))) return "Entrando"; if (["out", "exit", "reverse"].some((x) => t.includes(x))) return "Saindo"; return this._text(v); }
   _listLabel(v) { const t = this._token(v); if (t.includes("allow") || t.includes("whitelist")) return "Registrado"; if (t.includes("black") || t.includes("block")) return "Bloqueado"; if (t.includes("other")) return "Outro"; return this._text(v); }
   _confidence(v) { const n = Number(v); if (!Number.isNaN(n)) return `${Math.round(n <= 1 ? n * 100 : n)}%`; return this._text(v); }
-  _key(i) { return [i.source, i.entity_id, i.when, i.plate, i.unlock_type, i.number, i.image_path, i.detection_image_path, i.license_plate_image_path, i.vehicle_image_path].map((x) => x || "").join("|"); }
+  _vehicleType(v) { const t = this._token(v); return { sedan: "Sedan", saloon: "Sedan", hatchback: "Hatch", suv: "SUV", mpv: "MPV", van: "Van", minivan: "Minivan", truck: "Caminhão", pickup: "Picape", pickuptruck: "Picape", bus: "Ônibus", motorcycle: "Moto", motorbike: "Moto", bike: "Moto", coupe: "Cupê", wagon: "Perua", estate: "Perua", convertible: "Conversível", cabrio: "Conversível", vehicle: "Veículo", unknown: "Desconhecido", unkown: "Desconhecido", other: "Outro" }[t] || this._text(v); }
+  _colorLabel(v) { const t = this._token(v); return { black: "Preto", white: "Branco", gray: "Cinza", grey: "Cinza", silver: "Prata", blue: "Azul", red: "Vermelho", green: "Verde", yellow: "Amarelo", orange: "Laranja", brown: "Marrom", purple: "Roxo", violet: "Violeta", beige: "Bege", gold: "Dourado", pink: "Rosa", cyan: "Ciano", unknown: "Desconhecido", unkown: "Desconhecido", other: "Outro" }[t] || this._text(v); }
+  _key(i) { return [i.source, i.entity_id, i.when, i.plate, i.unlock_type, i.number, i.door_id, i.image_path, i.detection_image_path, i.license_plate_image_path, i.vehicle_image_path].map((x) => x || "").join("|"); }
   _dedupe(items) { const seen = new Set(); return items.filter((i) => { const k = this._key(i); if (seen.has(k)) return false; seen.add(k); return true; }); }
-  _isGhost(item) { return item.source === "anpr" ? !this._primaryImage(item) && [item.plate,item.direction,item.list_result,item.brand,item.type,item.color,item.country,item.confidence].every((x) => this._text(x, "") === "") : !item.when || (this._text(item.raw_state, "").toLowerCase() === "unknown"); }
+  _isGhost(item) {
+    if (item.source === "intercom") return !item.when || ["unknown", "unavailable", "none"].includes(String(item.raw_state || "").trim().toLowerCase());
+    return !this._primaryImage(item) && [item.camera_event_time, item.plate, item.direction, item.list_result, item.country, item.brand, item.type, item.color, item.confidence].every((x) => !this._hasValue(x));
+  }
 }
 
 class HikvisionUnlockEventsCardAlias extends HikvisionEventsCard {}
@@ -406,7 +552,7 @@ if (!window.customCards.some((c) => c.type === "hikvision-events-card")) {
   window.customCards.push({
     type: "hikvision-events-card",
     name: "Hikvision Events Card",
-    description: "Card de eventos Hikvision Intercom e ANPR",
+    description: "Card unificado para eventos Intercom e ANPR da Hikvision",
     preview: true,
   });
 }
